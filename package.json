@@ -1,0 +1,11 @@
+{
+  "name": "doran-chat",
+  "private": true,
+  "scripts": {
+    "db:local": "wrangler d1 migrations apply DB --local",
+    "dev": "wrangler dev --local"
+  },
+  "devDependencies": {
+    "wrangler": "4.168.0"
+  }
+}

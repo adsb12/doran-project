@@ -47,8 +47,12 @@ const client = roomPattern.test(storedClient || '') ? storedClient : randomId();
 save(clientKey, client);
 let nickname = read(nameKey) || '';
 let cursor = 0;
-let interval;
+let socket;
+let reconnectTimer;
+let reconnectDelay = 500;
 let loading = false;
+let needsRefresh = false;
+let initialized = false;
 const historyBox = el('history');
 const url = '/api/rooms/' + room;
 const time = new Intl.DateTimeFormat('ko-KR',{hour:'numeric',minute:'2-digit'});
@@ -58,9 +62,7 @@ function showRoom() {
   el('chat').hidden = false;
   el('new-room').hidden = false;
   el('my-name').textContent = '내 닉네임 · ' + nickname;
-  refresh();
-  clearInterval(interval);
-  interval = setInterval(refresh, 1800);
+  connect();
 }
 function addMessage(message) {
   const item = document.createElement('article');
@@ -75,24 +77,57 @@ function addMessage(message) {
   historyBox.append(item);
   el('empty').hidden = true;
 }
+function setConnected(connected) {
+  el('status').textContent = connected ? '연결됨' : '다시 연결하는 중';
+  el('status').classList.toggle('ready', connected);
+}
+function connect() {
+  if (socket || reconnectTimer) return;
+  const address = new URL(url + '/socket', location.href);
+  address.protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const connection = new WebSocket(address);
+  socket = connection;
+  connection.addEventListener('open', () => { refresh(); });
+  connection.addEventListener('message', event => {
+    if (event.data === 'update') refresh();
+  });
+  connection.addEventListener('close', () => {
+    socket = undefined;
+    setConnected(false);
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = undefined;
+      connect();
+    }, reconnectDelay);
+    reconnectDelay = Math.min(reconnectDelay * 2, 10000);
+  });
+}
 async function refresh() {
-  if (loading || el('chat').hidden) return;
+  needsRefresh = true;
+  if (loading) return;
   loading = true;
   try {
-    const response = await fetch(url + '?after=' + cursor, {signal:AbortSignal.timeout(8000)});
-    if (!response.ok) throw new Error();
-    const messages = await response.json();
-    const nearBottom = historyBox.scrollHeight - historyBox.scrollTop - historyBox.clientHeight < 85;
-    for (const message of messages) {
-      addMessage(message);
-      cursor = message.id;
+    while (needsRefresh) {
+      needsRefresh = false;
+      const after = initialized ? cursor : '';
+      const response = await fetch(url + '?after=' + after, {signal:AbortSignal.timeout(8000)});
+      if (!response.ok) throw new Error();
+      const messages = await response.json();
+      const nearBottom = historyBox.scrollHeight - historyBox.scrollTop - historyBox.clientHeight < 85;
+      for (const message of messages) {
+        addMessage(message);
+        cursor = message.id;
+      }
+      if (initialized && messages.length === 100) needsRefresh = true;
+      initialized = true;
+      if (nearBottom && messages.length) historyBox.scrollTop = historyBox.scrollHeight;
     }
-    if (nearBottom && messages.length) historyBox.scrollTop = historyBox.scrollHeight;
-    el('status').textContent = '연결됨';
-    el('status').classList.add('ready');
+    if (socket?.readyState === WebSocket.OPEN) {
+      reconnectDelay = 500;
+      setConnected(true);
+    }
   } catch {
-    el('status').textContent = '다시 연결하는 중';
-    el('status').classList.remove('ready');
+    setConnected(false);
+    socket?.close();
   } finally { loading = false; }
 }
 el('nickname').value = nickname;
@@ -154,7 +189,6 @@ el('compose').addEventListener('submit', async event => {
     if (draft.value === previous) draft.value = '';
     el('feedback').textContent = '';
     historyBox.scrollTop = historyBox.scrollHeight;
-    refresh();
   } catch { el('feedback').textContent = '전송 상태를 확인하지 못했어요. 대화 기록을 확인해 주세요.'; }
   finally { el('send').disabled = false; draft.focus(); }
 });
@@ -170,49 +204,89 @@ export default {
     if (url.pathname === '/' && request.method === 'GET') {
       return new Response(page, {headers:{...noCache,'Content-Type':'text/html; charset=utf-8','X-Content-Type-Options':'nosniff'}});
     }
-    const route = /^\/api\/rooms\/([a-f0-9]{32})$/.exec(url.pathname);
+    const route = /^\/api\/rooms\/([a-f0-9]{32})(\/socket)?$/.exec(url.pathname);
     if (!route) return json({error:'찾을 수 없어요.'},404);
     const room = route[1];
     try {
+      if (route[2] || request.method === 'POST') {
+        if (route[2] && request.headers.get('Origin') !== url.origin) {
+          return json({error:'허용되지 않는 연결이에요.'},403);
+        }
+        return await env.CHAT_ROOMS.getByName(room).fetch(request);
+      }
       if (request.method === 'GET') {
-        const after = Number(url.searchParams.get('after') ?? 0);
-        if (!Number.isSafeInteger(after) || after < 0) return json({error:'잘못된 요청이에요.'},400);
-        const query = after
+        const rawAfter = url.searchParams.get('after');
+        const after = rawAfter ? Number(rawAfter) : null;
+        if (after !== null && (!Number.isSafeInteger(after) || after < 0)) return json({error:'잘못된 요청이에요.'},400);
+        const query = after !== null
           ? env.DB.prepare('SELECT id, client, nickname, body, sent_at FROM messages WHERE room = ? AND id > ? ORDER BY id LIMIT 100').bind(room, after)
           : env.DB.prepare('SELECT id, client, nickname, body, sent_at FROM messages WHERE room = ? ORDER BY id DESC LIMIT 100').bind(room);
         const {results} = await query.all();
-        return json(after ? results : results.reverse());
+        return json(after !== null ? results : results.reverse());
       }
-      if (request.method !== 'POST') return json({error:'지원하지 않는 요청이에요.'},405);
-      if (!request.headers.get('Content-Type')?.startsWith('application/json')) return json({error:'잘못된 요청이에요.'},415);
-      const reader = request.body?.getReader();
-      if (!reader) return json({error:'잘못된 요청이에요.'},400);
-      const decoder = new TextDecoder();
-      let payload = '';
-      let size = 0;
-      for (;;) {
-        const {done,value} = await reader.read();
-        if (done) break;
-        size += value.byteLength;
-        if (size > 8192) {
-          await reader.cancel();
-          return json({error:'메시지가 너무 길어요.'},413);
-        }
-        payload += decoder.decode(value,{stream:true});
-      }
-      let data;
-      try { data = JSON.parse(payload + decoder.decode()); }
-      catch { return json({error:'잘못된 요청이에요.'},400); }
-      const client = data?.client;
-      const nickname = typeof data?.nickname === 'string' ? data.nickname.trim() : '';
-      const body = typeof data?.body === 'string' ? data.body.trim() : '';
-      if (typeof client !== 'string' || !idPattern.test(client) || !nickname || nickname.length > 24 || !body || body.length > 1000) {
-        return json({error:'닉네임과 메시지를 확인해 주세요.'},400);
-      }
-      await env.DB.prepare('INSERT INTO messages (room, client, nickname, body, sent_at) VALUES (?, ?, ?, ?, ?)').bind(room, client, nickname, body, Date.now()).run();
-      return json({ok:true},201);
+      return json({error:'지원하지 않는 요청이에요.'},405);
     } catch {
       return json({error:'채팅 서버에 연결할 수 없어요.'},503);
     }
   }
 };
+
+export class ChatRoom {
+  constructor(state, env) {
+    this.state = state;
+    this.env = env;
+  }
+
+  async fetch(request) {
+    const url = new URL(request.url);
+    if (url.pathname.endsWith('/socket')) {
+      if (request.method !== 'GET' || request.headers.get('Upgrade')?.toLowerCase() !== 'websocket') {
+        return json({error:'웹소켓 연결이 필요해요.'},426);
+      }
+      const [client, server] = Object.values(new WebSocketPair());
+      this.state.acceptWebSocket(server);
+      return new Response(null, {status:101, webSocket:client});
+    }
+
+    const room = url.pathname.split('/').at(-1);
+    if (request.method !== 'POST') return json({error:'지원하지 않는 요청이에요.'},405);
+    if (!request.headers.get('Content-Type')?.startsWith('application/json')) return json({error:'잘못된 요청이에요.'},415);
+    const reader = request.body?.getReader();
+    if (!reader) return json({error:'잘못된 요청이에요.'},400);
+    const decoder = new TextDecoder();
+    let payload = '';
+    let size = 0;
+    for (;;) {
+      const {done,value} = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > 8192) {
+        await reader.cancel();
+        return json({error:'메시지가 너무 길어요.'},413);
+      }
+      payload += decoder.decode(value,{stream:true});
+    }
+    let data;
+    try { data = JSON.parse(payload + decoder.decode()); }
+    catch { return json({error:'잘못된 요청이에요.'},400); }
+    const client = data?.client;
+    const nickname = typeof data?.nickname === 'string' ? data.nickname.trim() : '';
+    const body = typeof data?.body === 'string' ? data.body.trim() : '';
+    if (typeof client !== 'string' || !idPattern.test(client) || !nickname || nickname.length > 24 || !body || body.length > 1000) {
+      return json({error:'닉네임과 메시지를 확인해 주세요.'},400);
+    }
+    await this.env.DB.prepare('INSERT INTO messages (room, client, nickname, body, sent_at) VALUES (?, ?, ?, ?, ?)').bind(room, client, nickname, body, Date.now()).run();
+    for (const socket of this.state.getWebSockets()) {
+      try { socket.send('update'); } catch { /* The client may have disconnected. */ }
+    }
+    return json({ok:true},201);
+  }
+
+  webSocketClose(socket, code) {
+    socket.close(code === 1005 || code === 1006 ? 1000 : code);
+  }
+
+  webSocketMessage(socket) {
+    socket.close(1008, 'This connection only sends updates');
+  }
+}
